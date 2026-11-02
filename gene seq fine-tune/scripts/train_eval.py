@@ -108,7 +108,9 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
     val_baseline = drug_dataset_baselines(train_df, val_df)
     test_df = bundle.responses.iloc[test_rows]
     test_baseline = drug_dataset_baselines(train_df, test_df)
-    y_train = train_df[TARGET_COLUMNS].to_numpy(dtype=np.float32) - train_baseline
+    within_drug_mode = args.prediction_mode == "within_drug"
+    y_train_raw = train_df[TARGET_COLUMNS].to_numpy(dtype=np.float32)
+    y_train = y_train_raw - train_baseline if within_drug_mode else y_train_raw
     target_mean = y_train.mean(axis=0)
     target_scale = y_train.std(axis=0)
     target_scale[target_scale < 1e-8] = 1.0
@@ -135,8 +137,11 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
                              torch.from_numpy(train_idx[2]), torch.from_numpy(y_scaled.astype(np.float32)))
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_tensors = tuple(torch.as_tensor(x, dtype=torch.long, device=device) for x in val_idx)
+    val_y = val_df[TARGET_COLUMNS].to_numpy(dtype=np.float32)
+    if within_drug_mode:
+        val_y = val_y - val_baseline
     val_targets = torch.as_tensor(
-        (val_df[TARGET_COLUMNS].to_numpy(dtype=np.float32) - val_baseline - target_mean) / target_scale,
+        (val_y - target_mean) / target_scale,
         dtype=torch.float32, device=device,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -151,9 +156,12 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
             optimizer.zero_grad(set_to_none=True)
             prediction = model(feature_tensor[batch_line], batch_drug, batch_dataset)
             regression_loss = loss_fn(prediction, batch_y)
-            ranking_loss = within_group_pairwise_rank_loss(
-                prediction, batch_y, batch_drug, batch_dataset, batch_line, args.ranking_tie_epsilon,
-            )
+            if within_drug_mode:
+                ranking_loss = within_group_pairwise_rank_loss(
+                    prediction, batch_y, batch_drug, batch_dataset, batch_line, args.ranking_tie_epsilon,
+                )
+            else:
+                ranking_loss = prediction.sum() * 0.0
             loss = regression_loss + args.ranking_loss_weight * ranking_loss
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -162,10 +170,13 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
         with torch.inference_mode():
             val_prediction = model(feature_tensor[val_tensors[0]], val_tensors[1], val_tensors[2])
             val_regression_loss = loss_fn(val_prediction, val_targets)
-            val_ranking_loss = within_group_pairwise_rank_loss(
-                val_prediction, val_targets, val_tensors[1], val_tensors[2], val_tensors[0],
-                args.ranking_tie_epsilon,
-            )
+            if within_drug_mode:
+                val_ranking_loss = within_group_pairwise_rank_loss(
+                    val_prediction, val_targets, val_tensors[1], val_tensors[2], val_tensors[0],
+                    args.ranking_tie_epsilon,
+                )
+            else:
+                val_ranking_loss = val_prediction.sum() * 0.0
             val_loss = float((val_regression_loss + args.ranking_loss_weight * val_ranking_loss).item())
         if val_loss < best_loss - args.min_delta:
             best_loss = val_loss
@@ -185,8 +196,8 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
         test_drug = torch.as_tensor(test_idx[1], dtype=torch.long, device=device)
         test_dataset = torch.as_tensor(test_idx[2], dtype=torch.long, device=device)
         test_prediction = model(feature_tensor[test_line], test_drug, test_dataset)
-    predicted_residual = test_prediction.cpu().numpy() * target_scale + target_mean
-    prediction = predicted_residual + test_baseline
+    predicted_target = test_prediction.cpu().numpy() * target_scale + target_mean
+    prediction = predicted_target + test_baseline if within_drug_mode else predicted_target
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     saved_state = {key: value.detach().cpu() for key, value in best_state.items() if key != "gene_embeddings"}
@@ -195,7 +206,8 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
     )
     drug_baseline_records = train_df.groupby("DRUG_ID")[TARGET_COLUMNS].mean().reset_index().to_dict(orient="records")
     torch.save({
-        "model_type": kind, "fold": fold, "model_state_dict": saved_state,
+        "model_type": kind, "fold": fold, "prediction_mode": args.prediction_mode,
+        "model_state_dict": saved_state,
         "target_mean": target_mean.tolist(), "target_scale": target_scale.tolist(),
         "drug_dataset_baselines": group_baseline_records,
         "drug_baseline_fallbacks": drug_baseline_records,
@@ -206,15 +218,24 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
         "model_config": {"projection_dim": args.projection_dim, "drug_dim": args.drug_dim,
                          "n_components": n_components, "dropout": args.dropout,
                          "ranking_loss_weight": args.ranking_loss_weight,
-                         "prediction_target": "training-fold drug-dataset-centered residual"},
+                         "prediction_target": ("training-fold drug-dataset-centered residual"
+                                               if within_drug_mode else "raw response")},
     }, checkpoint_dir / f"{kind}_fold_{fold:02d}.pt")
     return prediction, best_epoch, best_loss, test_baseline
 
 
-def drug_mean_predictions(bundle, train_rows, test_rows):
+def drug_mean_predictions(bundle, train_rows, test_rows, prediction_mode: str):
     train = bundle.responses.iloc[train_rows]
     test = bundle.responses.iloc[test_rows]
-    return drug_dataset_baselines(train, test)
+    if prediction_mode == "within_drug":
+        return drug_dataset_baselines(train, test)
+    global_mean = train[TARGET_COLUMNS].mean()
+    drug_means = train.groupby("DRUG_ID")[TARGET_COLUMNS].mean()
+    return np.vstack([
+        drug_means.loc[drug].to_numpy(dtype=np.float32) if drug in drug_means.index
+        else global_mean.to_numpy(dtype=np.float32)
+        for drug in test["DRUG_ID"]
+    ])
 
 
 def main():
@@ -226,8 +247,11 @@ def main():
     parser.add_argument("--gene-embeddings", type=Path,
                         default=DEFAULT_OMICS_DIR / "human_gene_gobert_embeddings.npz",
                         help="Packed NPZ made by export_gene_embeddings.py")
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_DIR / "results" / "breast_v1",
-                        help="Output folder (defaults inside this project directory)")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output folder (defaults to a mode-specific folder inside this project)")
+    parser.add_argument("--prediction-mode", choices=["global_cell_line", "within_drug"],
+                        default="global_cell_line",
+                        help="Global raw-response regression or drug/dataset-centered regression plus ranking")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--n-pcs", type=int, default=20)
@@ -249,6 +273,9 @@ def main():
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = parser.parse_args()
+    if args.output_dir is None:
+        mode_folder = "breast_global_cell_line_v2" if args.prediction_mode == "global_cell_line" else "breast_within_drug_v1"
+        args.output_dir = PROJECT_DIR / "results" / mode_folder
     for input_path, label in ((args.expression, "expression matrix"),
                               (args.responses, "drug response table"),
                               (args.gene_embeddings, "GoBERT embedding archive")):
@@ -296,8 +323,10 @@ def main():
                          "n_train_cell_lines": response.iloc[train_rows]["ModelID"].nunique(),
                          "n_validation_cell_lines": response.iloc[validation_rows]["ModelID"].nunique(),
                          "n_test_cell_lines": response.iloc[test_rows]["ModelID"].nunique(),
-                         "best_epoch": best_epoch, "best_validation_combined_loss": best_loss})
-        oof["drug_mean"][test_rows] = drug_mean_predictions(bundle, train_rows, test_rows)
+                         "best_epoch": best_epoch, "best_validation_objective": best_loss})
+        oof["drug_mean"][test_rows] = drug_mean_predictions(
+            bundle, train_rows, test_rows, args.prediction_mode,
+        )
         if np.isnan(baseline_oof[test_rows]).any():
             train_df = response.iloc[train_rows]
             baseline_oof[test_rows] = drug_dataset_baselines(train_df, response.iloc[test_rows])

@@ -9,7 +9,10 @@ This package implements the first GoBERT-plus-expression drug-response model dis
 3. `GoBERTExpressionFusion` projects each gene vector to 128 dimensions, gates it using that cell line's standardized expression, and mean-pools the gated gene vectors to a cell-line vector. It fuses that vector with a learned drug-ID embedding and a GDSC dataset embedding, then predicts AUC and log2(IC50).
 4. `ExpressionDrugFusion` uses expression-only PCA features with the same drug and dataset inputs. This is the no-GoBERT neural comparison.
 
-Both neural models learn residual responses relative to the training-fold mean for each drug and dataset. Their training objective combines residual regression loss with a pairwise ranking loss over distinct cell lines measured with the same drug and dataset. The drug-mean baseline predicts the corresponding training-fold mean and has zero within-drug residual.
+Choose the response objective with `--prediction-mode`:
+
+- `global_cell_line` (default) preserves the original task: regress the raw AUC and log2(IC50) response for each cell-line/drug pair. The neural models use regression loss; the drug-mean baseline is the training-fold mean for each drug.
+- `within_drug` predicts response deviations from the training-fold mean for each drug and dataset. The neural models combine residual regression with a pairwise ranking loss over distinct cell lines measured with the same drug and dataset. The drug-mean baseline predicts zero residual.
 
 Evaluation uses five-fold `GroupKFold` by `ModelID`, with a cell-line-grouped validation subset inside each training fold. GDSC1/GDSC2 rows remain separate measurements and carry a dataset indicator.
 
@@ -18,7 +21,7 @@ Evaluation uses five-fold `GroupKFold` by `ModelID`, with a cell-line-grouped va
 - Response targets: `AUC_PUBLISHED` and `log2(IC50_PUBLISHED)`, with log2 computed from positive `IC50_PUBLISHED` values.
 - Reports: RMSE, MAE, R², Pearson r, and Spearman rho for AUC, log2(IC50), and back-transformed raw IC50.
 - Results include global out-of-fold metrics and macro-averaged per-drug metrics, plus per-drug details. `AUC_PUBLISHED` is the dose-response label, not AUROC.
-- `metrics_within_drug_summary.csv` reports residual RMSE/MAE and macro per-drug Spearman rho and concordance index. Ranking comparisons are restricted to the same drug, dataset, and held-out fold; groups need at least four distinct cell lines by default. `metrics_within_drug_by_group.csv` contains the individual drug/dataset/fold scores. The OOF predictions include fold-training drug means and the corresponding residual targets and predictions.
+- Both modes report `metrics_within_drug_summary.csv` with fold-centered residual RMSE/MAE and macro per-drug Spearman rho and concordance index. Ranking comparisons are restricted to the same drug, dataset, and held-out fold; groups need at least four distinct cell lines by default. `metrics_within_drug_by_group.csv` contains individual drug/dataset/fold scores. The OOF predictions include fold-training drug means and the corresponding residual targets and predictions.
 
 ## Setup
 
@@ -26,7 +29,7 @@ Evaluation uses five-fold `GroupKFold` by `ModelID`, with a cell-line-grouped va
 python -m pip install -r requirements.txt
 ```
 
-In Colab, training defaults to the mounted Drive files under `/content/drive/MyDrive/OMICS/gene seq`. Output defaults to this project directory's `results/breast_v1` folder. Override the CLI paths if your filenames or folders differ.
+In Colab, training defaults to the mounted Drive files under `/content/drive/MyDrive/OMICS/gene seq`. Output defaults to a mode-specific folder inside the project (`results/breast_global_cell_line_v2` or `results/breast_within_drug_v1`). Override the CLI paths if your filenames or folders differ.
 
 ## Run the embedding export in Colab
 
@@ -71,32 +74,32 @@ For example, `term_embeddings[offsets[i]:offsets[i+1]]` recovers gene `i`'s (N_i
 
 ## Step 2: train and evaluate
 
-For the Colab layout, mount Drive and run from the project directory. This assumes the project files are present at `/content/gene_seq_finetune` and the exported NPZ plus the two CSV files are in `MyDrive/OMICS/gene seq`:
+For the Colab layout, mount Drive and run from the project directory. This assumes the project files are present at `/content/L4/gene seq fine-tune` and the exported NPZ plus the two CSV files are in `MyDrive/OMICS/gene seq`:
 
 ```python
 from google.colab import drive
 drive.mount('/content/drive')
-%cd /content/gene_seq_finetune
+%cd "/content/L4/gene seq fine-tune"
 %pip install -r requirements.txt
 !python scripts/train_eval.py
 ```
 
-By default, results are written to `/content/gene_seq_finetune/results/breast_v1`. To preserve them in Drive, pass an output directory there:
+The command above uses `global_cell_line`. To run the within-drug objective, use:
 
 ```python
-!python scripts/train_eval.py --output-dir "/content/drive/MyDrive/OMICS/gene seq fine-tune/results/breast_v1"
+!python scripts/train_eval.py --prediction-mode within_drug
 ```
 
-The script checks that the expression, response, and embedding files exist before loading them. You can supply alternative paths with `--expression`, `--responses`, and `--gene-embeddings`.
+By default, the two modes write to separate result folders, preserving one another's outputs. To save results persistently in Drive, add an `--output-dir` path, for example `--output-dir "/content/drive/MyDrive/OMICS/gene seq fine-tune/results/within_drug_v1"`. The script checks that the expression, response, and embedding files exist before loading them. You can supply alternative paths with `--expression`, `--responses`, and `--gene-embeddings`.
 
 ```powershell
 python scripts\train_eval.py `
   --expression "H:\OMICS\datasets_v0\gene seq\gene_expression_breast.csv" `
   --responses "H:\OMICS\datasets_v0\gene seq\drug_response_breast_matched.csv" `
   --gene-embeddings "data\human_gene_gobert_embeddings.npz" `
-  --output-dir "results\breast_v1" --device auto
+  --prediction-mode global_cell_line --output-dir "results\breast_global_cell_line_v2" --device auto
 ```
 
 Outputs include out-of-fold predictions, metrics, checkpoints, and preprocessing objects. The drug input is a learned `DRUG_ID` embedding, so it predicts for compounds represented during training, not genuinely unseen drugs. Precomputed GoBERT vectors remain frozen; the expression gate, projection, drug/dataset embeddings, and response heads are trained.
 
-The within-drug pairwise ranking loss weight defaults to `0.1`; adjust it with `--ranking-loss-weight`. `--min-ranking-samples` controls the minimum number of distinct held-out cell lines required to report per-group ranking metrics.
+In `within_drug` mode, the pairwise ranking loss weight defaults to `0.1`; adjust it with `--ranking-loss-weight`. `--min-ranking-samples` controls the minimum number of distinct held-out cell lines required to report per-group ranking metrics. The original raw-response task remains available with `--prediction-mode global_cell_line`.
