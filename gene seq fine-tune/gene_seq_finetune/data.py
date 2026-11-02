@@ -15,7 +15,8 @@ class DataBundle:
     model_to_row: dict[str, int]
     gene_ids: list[str]
     gene_symbols: list[str]
-    gene_embeddings: np.ndarray
+    gene_term_embeddings: np.ndarray
+    gene_term_to_gene: np.ndarray
     drug_to_idx: dict[str, int]
     dataset_to_idx: dict[str, int]
 
@@ -43,18 +44,12 @@ def load_bundle(expression_path: Path, response_path: Path, embedding_path: Path
             raise ValueError("Packed embedding NPZ must contain term_embeddings [terms, dim] and offsets [genes+1]")
         if offsets[0] != 0 or offsets[-1] != len(term_matrix) or np.any(np.diff(offsets) < 0):
             raise ValueError("Invalid offsets in packed embedding NPZ")
-        # Keep the archive in float16 on disk/in memory, then pool each gene's
-        # term vectors to the baseline's one-vector-per-gene representation.
-        # This avoids expanding the full archive to float32 at once.
-        emb_matrix = np.empty((len(emb_ids), term_matrix.shape[1]), dtype=np.float32)
-        for i, (left, right) in enumerate(zip(offsets[:-1], offsets[1:])):
-            if right <= left:
-                raise ValueError(f"Gene {emb_ids[i]} has no stored GO-term vectors")
-            emb_matrix[i] = term_matrix[left:right].mean(axis=0, dtype=np.float32)
+        packed_terms = True
     else:
-        emb_matrix = np.asarray(raw["embeddings"], dtype=np.float32)
-        if emb_matrix.ndim != 2 or len(emb_ids) != emb_matrix.shape[0]:
+        legacy_matrix = np.asarray(raw["embeddings"], dtype=np.float32)
+        if legacy_matrix.ndim != 2 or len(emb_ids) != legacy_matrix.shape[0]:
             raise ValueError("Embedding NPZ must have matching entrez_gene_ids and embeddings")
+        packed_terms = False
     if len(emb_ids) != len(set(emb_ids)):
         raise ValueError("Duplicate Entrez Gene IDs in GoBERT embedding NPZ")
     emb_index = {gene_id: i for i, gene_id in enumerate(emb_ids)}
@@ -65,7 +60,23 @@ def load_bundle(expression_path: Path, response_path: Path, embedding_path: Path
     gene_ids = [expr_gene_ids[i] for i in keep]
     gene_symbols = [parsed[i][0] for i in keep]
     expression = expression_df.iloc[:, [i + 1 for i in keep]].to_numpy(dtype=np.float32)
-    embeddings = emb_matrix[[emb_index[gene_id] for gene_id in gene_ids]]
+    if packed_terms:
+        term_chunks = []
+        term_gene_chunks = []
+        for gene_idx, gene_id in enumerate(gene_ids):
+            source_idx = emb_index[gene_id]
+            left, right = offsets[source_idx:source_idx + 2]
+            if right <= left:
+                raise ValueError(f"Gene {gene_id} has no stored GO-term vectors")
+            term_chunks.append(np.asarray(term_matrix[left:right], dtype=np.float32))
+            term_gene_chunks.append(np.full(right - left, gene_idx, dtype=np.int64))
+        gene_term_embeddings = np.concatenate(term_chunks, axis=0)
+        gene_term_to_gene = np.concatenate(term_gene_chunks)
+    else:
+        # Legacy archives contain one pre-pooled vector per gene. Treat each
+        # vector as a one-term sequence so the same model remains usable.
+        gene_term_embeddings = legacy_matrix[[emb_index[gene_id] for gene_id in gene_ids]]
+        gene_term_to_gene = np.arange(len(gene_ids), dtype=np.int64)
 
     model_ids = expression_df["ModelID"].astype(str).tolist()
     if len(model_ids) != len(set(model_ids)):
@@ -91,7 +102,8 @@ def load_bundle(expression_path: Path, response_path: Path, embedding_path: Path
     drugs = sorted(responses["DRUG_ID"].unique())
     datasets = sorted(responses["DATASET"].unique())
     return DataBundle(
-        responses, expression, model_to_row, gene_ids, gene_symbols, embeddings,
+        responses, expression, model_to_row, gene_ids, gene_symbols,
+        gene_term_embeddings, gene_term_to_gene,
         {value: i for i, value in enumerate(drugs)},
         {value: i for i, value in enumerate(datasets)},
     )

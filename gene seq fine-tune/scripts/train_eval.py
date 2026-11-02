@@ -117,8 +117,10 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
 
     if kind == "gobert_expression_fusion":
         model = GoBERTExpressionFusion(
-            bundle.gene_embeddings, len(bundle.drug_to_idx), len(bundle.dataset_to_idx),
+            bundle.gene_term_embeddings, bundle.gene_term_to_gene, len(bundle.gene_ids),
+            len(bundle.drug_to_idx), len(bundle.dataset_to_idx),
             projection_dim=args.projection_dim, drug_dim=args.drug_dim, dropout=args.dropout,
+            go_pooling=args.go_pooling,
         ).to(device)
         feature_matrix = standardized_expression
     else:
@@ -200,7 +202,10 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
     prediction = predicted_target + test_baseline if within_drug_mode else predicted_target
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    saved_state = {key: value.detach().cpu() for key, value in best_state.items() if key != "gene_embeddings"}
+    saved_state = {
+        key: value.detach().cpu() for key, value in best_state.items()
+        if key not in {"gene_term_embeddings", "gene_term_to_gene"}
+    }
     group_baseline_records = (
         train_df.groupby(["DRUG_ID", "DATASET"])[TARGET_COLUMNS].mean().reset_index().to_dict(orient="records")
     )
@@ -217,6 +222,7 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
         "best_epoch": best_epoch,
         "model_config": {"projection_dim": args.projection_dim, "drug_dim": args.drug_dim,
                          "n_components": n_components, "dropout": args.dropout,
+                         "go_pooling": args.go_pooling,
                          "ranking_loss_weight": args.ranking_loss_weight,
                          "prediction_target": ("training-fold drug-dataset-centered residual"
                                                if within_drug_mode else "raw response")},
@@ -256,6 +262,8 @@ def main():
     parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--n-pcs", type=int, default=20)
     parser.add_argument("--projection-dim", type=int, default=128)
+    parser.add_argument("--go-pooling", choices=["attention", "mean"], default="attention",
+                        help="Learned attention pooling of each gene's GO vectors, or mean-pooling baseline")
     parser.add_argument("--drug-dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--epochs", type=int, default=80)
@@ -274,7 +282,7 @@ def main():
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = parser.parse_args()
     if args.output_dir is None:
-        mode_folder = "breast_global_cell_line_v2" if args.prediction_mode == "global_cell_line" else "breast_within_drug_v1"
+        mode_folder = f"breast_{args.prediction_mode}_go_{args.go_pooling}_v1"
         args.output_dir = PROJECT_DIR / "results" / mode_folder
     for input_path, label in ((args.expression, "expression matrix"),
                               (args.responses, "drug response table"),
@@ -364,7 +372,9 @@ def main():
     config = vars(args)
     config.update({"device_resolved": str(device), "n_samples": int(len(response)),
                    "n_cell_lines": int(response["ModelID"].nunique()), "n_drugs": int(response["DRUG_ID"].nunique()),
-                   "n_aligned_genes": int(len(bundle.gene_ids)), "gobert_embedding_dim": int(bundle.gene_embeddings.shape[1])})
+                   "n_aligned_genes": int(len(bundle.gene_ids)),
+                   "n_aligned_go_term_vectors": int(len(bundle.gene_term_embeddings)),
+                   "gobert_embedding_dim": int(bundle.gene_term_embeddings.shape[1])})
     (args.output_dir / "run_config.json").write_text(json.dumps(config, indent=2, default=str), encoding="utf-8")
     print(global_metrics.to_string(index=False))
     print("\nWithin-drug residual regression and ranking metrics:")

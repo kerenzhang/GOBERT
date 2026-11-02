@@ -5,8 +5,8 @@ This package implements the first GoBERT-plus-expression drug-response model dis
 ## Model and data flow
 
 1. `scripts/export_gene_embeddings.py` encodes each human gene's distinct positive GO annotations with the released `MM-YY-WW/GoBERT` checkpoint. It saves the final contextual state for every GO token, preserving a separate (N_g \times 1024) matrix for each Entrez Gene ID. This is a frozen feature export, not end-to-end GoBERT fine-tuning.
-2. The training script aligns genes with the breast expression matrix by Entrez Gene ID and mean-pools each gene's saved GO-term matrix for this initial baseline. The individual term vectors remain available in the archive for learned pooling later.
-3. `GoBERTExpressionFusion` projects each gene vector to 128 dimensions, gates it using that cell line's standardized expression, and mean-pools the gated gene vectors to a cell-line vector. It fuses that vector with a learned drug-ID embedding and a GDSC dataset embedding, then predicts AUC and log2(IC50).
+2. The training script aligns genes with the breast expression matrix by Entrez Gene ID and keeps the packed per-term vectors instead of averaging them during data loading.
+3. By default, `GoBERTExpressionFusion` learns an attention score for each gene's contextualized GO-term vectors, normalizes the scores within that gene, and pools them into one gene vector. It projects that vector, gates it using the cell line's standardized expression, and mean-pools the gated gene vectors into a cell-line vector. It fuses that vector with learned drug-ID and GDSC dataset embeddings, then predicts AUC and log2(IC50). Use `--go-pooling mean` to run a mean-pooling comparison; `--go-pooling attention` selects learned pooling.
 4. `ExpressionDrugFusion` uses expression-only PCA features with the same drug and dataset inputs. This is the no-GoBERT neural comparison.
 
 Choose the response objective with `--prediction-mode`:
@@ -29,7 +29,7 @@ Evaluation uses five-fold `GroupKFold` by `ModelID`, with a cell-line-grouped va
 python -m pip install -r requirements.txt
 ```
 
-In Colab, training defaults to the mounted Drive files under `/content/drive/MyDrive/OMICS/gene seq`. Output defaults to a mode-specific folder inside the project (`results/breast_global_cell_line_v2` or `results/breast_within_drug_v1`). Override the CLI paths if your filenames or folders differ.
+In Colab, training defaults to the mounted Drive files under `/content/drive/MyDrive/OMICS/gene seq`. Output defaults to separate folders by response and pooling mode, such as `results/breast_global_cell_line_go_attention_v1` and `results/breast_within_drug_go_attention_v1`. Mean-pooling runs use a `_go_mean_v1` folder. Override the CLI paths if your filenames or folders differ.
 
 ## Run the embedding export in Colab
 
@@ -90,7 +90,7 @@ The command above uses `global_cell_line`. To run the within-drug objective, use
 !python scripts/train_eval.py --prediction-mode within_drug
 ```
 
-By default, the two modes write to separate result folders, preserving one another's outputs. To save results persistently in Drive, add an `--output-dir` path, for example `--output-dir "/content/drive/MyDrive/OMICS/gene seq fine-tune/results/within_drug_v1"`. The script checks that the expression, response, and embedding files exist before loading them. You can supply alternative paths with `--expression`, `--responses`, and `--gene-embeddings`.
+By default, each response mode and GO pooling choice writes to a separate result folder, preserving other runs. To save results persistently in Drive, add an `--output-dir` path, for example `--output-dir "/content/drive/MyDrive/OMICS/gene seq fine-tune/results/within_drug_attention_v1"`. The script checks that the expression, response, and embedding files exist before loading them. You can supply alternative paths with `--expression`, `--responses`, and `--gene-embeddings`.
 
 ```powershell
 python scripts\train_eval.py `
@@ -100,6 +100,6 @@ python scripts\train_eval.py `
   --prediction-mode global_cell_line --output-dir "results\breast_global_cell_line_v2" --device auto
 ```
 
-Outputs include out-of-fold predictions, metrics, checkpoints, and preprocessing objects. The drug input is a learned `DRUG_ID` embedding, so it predicts for compounds represented during training, not genuinely unseen drugs. Precomputed GoBERT vectors remain frozen; the expression gate, projection, drug/dataset embeddings, and response heads are trained.
+Outputs include out-of-fold predictions, metrics, checkpoints, and preprocessing objects. The drug input is a learned `DRUG_ID` embedding, so it predicts for compounds represented during training, not genuinely unseen drugs. Precomputed GoBERT vectors remain frozen; GO-term attention pooling, the expression gate, projection, drug/dataset embeddings, and response heads are trained. Checkpoints store the learned pooling parameters and refer to the packed embedding archive for the fixed vectors.
 
 In `within_drug` mode, the pairwise ranking loss weight defaults to `0.1`; adjust it with `--ranking-loss-weight`. `--min-ranking-samples` controls the minimum number of distinct held-out cell lines required to report per-group ranking metrics. The original raw-response task remains available with `--prediction-mode global_cell_line`.
