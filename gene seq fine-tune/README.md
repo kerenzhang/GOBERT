@@ -9,6 +9,8 @@ This package implements the first GoBERT-plus-expression drug-response model dis
 3. `GoBERTExpressionFusion` projects each gene vector to 128 dimensions, gates it using that cell line's standardized expression, and mean-pools the gated gene vectors to a cell-line vector. It fuses that vector with a learned drug-ID embedding and a GDSC dataset embedding, then predicts AUC and log2(IC50).
 4. `ExpressionDrugFusion` uses expression-only PCA features with the same drug and dataset inputs. This is the no-GoBERT neural comparison.
 
+Both neural models learn residual responses relative to the training-fold mean for each drug and dataset. Their training objective combines residual regression loss with a pairwise ranking loss over distinct cell lines measured with the same drug and dataset. The drug-mean baseline predicts the corresponding training-fold mean and has zero within-drug residual.
+
 Evaluation uses five-fold `GroupKFold` by `ModelID`, with a cell-line-grouped validation subset inside each training fold. GDSC1/GDSC2 rows remain separate measurements and carry a dataset indicator.
 
 ## Targets and metrics
@@ -16,6 +18,7 @@ Evaluation uses five-fold `GroupKFold` by `ModelID`, with a cell-line-grouped va
 - Response targets: `AUC_PUBLISHED` and `log2(IC50_PUBLISHED)`, with log2 computed from positive `IC50_PUBLISHED` values.
 - Reports: RMSE, MAE, R², Pearson r, and Spearman rho for AUC, log2(IC50), and back-transformed raw IC50.
 - Results include global out-of-fold metrics and macro-averaged per-drug metrics, plus per-drug details. `AUC_PUBLISHED` is the dose-response label, not AUROC.
+- `metrics_within_drug_summary.csv` reports residual RMSE/MAE and macro per-drug Spearman rho and concordance index. Ranking comparisons are restricted to the same drug, dataset, and held-out fold; groups need at least four distinct cell lines by default. `metrics_within_drug_by_group.csv` contains the individual drug/dataset/fold scores. The OOF predictions include fold-training drug means and the corresponding residual targets and predictions.
 
 ## Setup
 
@@ -95,3 +98,5 @@ python scripts\train_eval.py `
 ```
 
 Outputs include out-of-fold predictions, metrics, checkpoints, and preprocessing objects. The drug input is a learned `DRUG_ID` embedding, so it predicts for compounds represented during training, not genuinely unseen drugs. Precomputed GoBERT vectors remain frozen; the expression gate, projection, drug/dataset embeddings, and response heads are trained.
+
+The within-drug pairwise ranking loss weight defaults to `0.1`; adjust it with `--ranking-loss-weight`. `--min-ranking-samples` controls the minimum number of distinct held-out cell lines required to report per-group ranking metrics.

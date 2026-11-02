@@ -14,11 +14,12 @@ from sklearn.decomposition import PCA
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gene_seq_finetune.data import load_bundle
-from gene_seq_finetune.metrics import summarize_predictions
+from gene_seq_finetune.metrics import summarize_predictions, summarize_within_drug
 from gene_seq_finetune.models import ExpressionDrugFusion, GoBERTExpressionFusion
 
 
@@ -58,11 +59,56 @@ def index_arrays(bundle, rows: pd.DataFrame):
     )
 
 
+def drug_dataset_baselines(reference_rows: pd.DataFrame, query_rows: pd.DataFrame) -> np.ndarray:
+    """Training-fold means per drug and dataset, with drug/global fallbacks."""
+    group_means = reference_rows.groupby(["DRUG_ID", "DATASET"])[TARGET_COLUMNS].mean()
+    drug_means = reference_rows.groupby("DRUG_ID")[TARGET_COLUMNS].mean()
+    global_mean = reference_rows[TARGET_COLUMNS].mean().to_numpy(dtype=np.float32)
+    result = np.empty((len(query_rows), len(TARGET_COLUMNS)), dtype=np.float32)
+    for i, (drug, dataset) in enumerate(zip(query_rows["DRUG_ID"], query_rows["DATASET"])):
+        key = (drug, dataset)
+        if key in group_means.index:
+            value = group_means.loc[key].to_numpy(dtype=np.float32)
+        elif drug in drug_means.index:
+            value = drug_means.loc[drug].to_numpy(dtype=np.float32)
+        else:
+            value = global_mean
+        result[i] = value
+    return result
+
+
+def within_group_pairwise_rank_loss(prediction, target, drug_idx, dataset_idx, line_idx, tie_epsilon: float):
+    """Pairwise logistic ranking loss, comparing only same-drug/dataset samples."""
+    batch_size = target.shape[0]
+    if batch_size < 2:
+        return prediction.sum() * 0.0
+    same_group = (
+        (drug_idx[:, None] == drug_idx[None, :])
+        & (dataset_idx[:, None] == dataset_idx[None, :])
+        & (line_idx[:, None] != line_idx[None, :])
+    )
+    pair_mask = torch.triu(same_group, diagonal=1)
+    losses = []
+    for target_idx in range(target.shape[1]):
+        target_diff = target[:, target_idx, None] - target[None, :, target_idx]
+        keep = pair_mask & (target_diff.abs() > tie_epsilon)
+        if keep.any():
+            pred_diff = prediction[:, target_idx, None] - prediction[None, :, target_idx]
+            direction = torch.sign(target_diff[keep])
+            losses.append(F.softplus(-direction * pred_diff[keep]).mean())
+    return torch.stack(losses).mean() if losses else prediction.sum() * 0.0
+
+
 def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
                        standardized_expression, expression_pcs, n_components,
                        args, device, fold, checkpoint_dir):
     train_df = bundle.responses.iloc[train_rows]
-    y_train = train_df[TARGET_COLUMNS].to_numpy(dtype=np.float32)
+    train_baseline = drug_dataset_baselines(train_df, train_df)
+    val_df = bundle.responses.iloc[validation_rows]
+    val_baseline = drug_dataset_baselines(train_df, val_df)
+    test_df = bundle.responses.iloc[test_rows]
+    test_baseline = drug_dataset_baselines(train_df, test_df)
+    y_train = train_df[TARGET_COLUMNS].to_numpy(dtype=np.float32) - train_baseline
     target_mean = y_train.mean(axis=0)
     target_scale = y_train.std(axis=0)
     target_scale[target_scale < 1e-8] = 1.0
@@ -82,9 +128,7 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
 
     feature_tensor = torch.as_tensor(feature_matrix, dtype=torch.float32, device=device)
     train_idx = index_arrays(bundle, train_df)
-    val_df = bundle.responses.iloc[validation_rows]
     val_idx = index_arrays(bundle, val_df)
-    test_df = bundle.responses.iloc[test_rows]
     test_idx = index_arrays(bundle, test_df)
     y_scaled = (y_train - target_mean) / target_scale
     train_ds = TensorDataset(torch.from_numpy(train_idx[0]), torch.from_numpy(train_idx[1]),
@@ -92,7 +136,7 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_tensors = tuple(torch.as_tensor(x, dtype=torch.long, device=device) for x in val_idx)
     val_targets = torch.as_tensor(
-        (val_df[TARGET_COLUMNS].to_numpy(dtype=np.float32) - target_mean) / target_scale,
+        (val_df[TARGET_COLUMNS].to_numpy(dtype=np.float32) - val_baseline - target_mean) / target_scale,
         dtype=torch.float32, device=device,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -106,14 +150,23 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
             batch_dataset, batch_y = batch_dataset.to(device), batch_y.to(device)
             optimizer.zero_grad(set_to_none=True)
             prediction = model(feature_tensor[batch_line], batch_drug, batch_dataset)
-            loss = loss_fn(prediction, batch_y)
+            regression_loss = loss_fn(prediction, batch_y)
+            ranking_loss = within_group_pairwise_rank_loss(
+                prediction, batch_y, batch_drug, batch_dataset, batch_line, args.ranking_tie_epsilon,
+            )
+            loss = regression_loss + args.ranking_loss_weight * ranking_loss
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
         model.eval()
         with torch.inference_mode():
             val_prediction = model(feature_tensor[val_tensors[0]], val_tensors[1], val_tensors[2])
-            val_loss = float(loss_fn(val_prediction, val_targets).item())
+            val_regression_loss = loss_fn(val_prediction, val_targets)
+            val_ranking_loss = within_group_pairwise_rank_loss(
+                val_prediction, val_targets, val_tensors[1], val_tensors[2], val_tensors[0],
+                args.ranking_tie_epsilon,
+            )
+            val_loss = float((val_regression_loss + args.ranking_loss_weight * val_ranking_loss).item())
         if val_loss < best_loss - args.min_delta:
             best_loss = val_loss
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -132,31 +185,36 @@ def train_neural_model(kind, bundle, train_rows, validation_rows, test_rows,
         test_drug = torch.as_tensor(test_idx[1], dtype=torch.long, device=device)
         test_dataset = torch.as_tensor(test_idx[2], dtype=torch.long, device=device)
         test_prediction = model(feature_tensor[test_line], test_drug, test_dataset)
-    prediction = test_prediction.cpu().numpy() * target_scale + target_mean
+    predicted_residual = test_prediction.cpu().numpy() * target_scale + target_mean
+    prediction = predicted_residual + test_baseline
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     saved_state = {key: value.detach().cpu() for key, value in best_state.items() if key != "gene_embeddings"}
+    group_baseline_records = (
+        train_df.groupby(["DRUG_ID", "DATASET"])[TARGET_COLUMNS].mean().reset_index().to_dict(orient="records")
+    )
+    drug_baseline_records = train_df.groupby("DRUG_ID")[TARGET_COLUMNS].mean().reset_index().to_dict(orient="records")
     torch.save({
         "model_type": kind, "fold": fold, "model_state_dict": saved_state,
         "target_mean": target_mean.tolist(), "target_scale": target_scale.tolist(),
+        "drug_dataset_baselines": group_baseline_records,
+        "drug_baseline_fallbacks": drug_baseline_records,
+        "global_baseline": train_df[TARGET_COLUMNS].mean().to_dict(),
         "gene_ids": bundle.gene_ids, "drug_to_idx": bundle.drug_to_idx,
         "dataset_to_idx": bundle.dataset_to_idx, "gene_embedding_file": str(args.gene_embeddings.resolve()),
         "best_epoch": best_epoch,
         "model_config": {"projection_dim": args.projection_dim, "drug_dim": args.drug_dim,
-                         "n_components": n_components, "dropout": args.dropout},
+                         "n_components": n_components, "dropout": args.dropout,
+                         "ranking_loss_weight": args.ranking_loss_weight,
+                         "prediction_target": "training-fold drug-dataset-centered residual"},
     }, checkpoint_dir / f"{kind}_fold_{fold:02d}.pt")
-    return prediction, best_epoch, best_loss
+    return prediction, best_epoch, best_loss, test_baseline
 
 
 def drug_mean_predictions(bundle, train_rows, test_rows):
     train = bundle.responses.iloc[train_rows]
     test = bundle.responses.iloc[test_rows]
-    global_mean = train[TARGET_COLUMNS].mean()
-    means = train.groupby("DRUG_ID")[TARGET_COLUMNS].mean()
-    return np.vstack([
-        means.loc[drug].to_numpy(dtype=float) if drug in means.index else global_mean.to_numpy(dtype=float)
-        for drug in test["DRUG_ID"]
-    ]).astype(np.float32)
+    return drug_dataset_baselines(train, test)
 
 
 def main():
@@ -182,6 +240,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--ranking-loss-weight", type=float, default=0.1,
+                        help="Weight for pairwise ranking loss within each drug and dataset")
+    parser.add_argument("--ranking-tie-epsilon", type=float, default=1e-4,
+                        help="Ignore response pairs closer than this after residual target scaling")
+    parser.add_argument("--min-ranking-samples", type=int, default=4,
+                        help="Minimum held-out cell lines in a drug/dataset/fold group for ranking metrics")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = parser.parse_args()
@@ -206,6 +270,7 @@ def main():
     outer = GroupKFold(n_splits=args.folds)
     model_names = ["gobert_expression_fusion", "expression_drug_fusion", "drug_mean"]
     oof = {name: np.full((len(response), 2), np.nan, dtype=np.float32) for name in model_names}
+    baseline_oof = np.full((len(response), 2), np.nan, dtype=np.float32)
     fold_ids = np.full(len(response), -1, dtype=np.int32)
     logs = []
 
@@ -220,18 +285,22 @@ def main():
         dump({**preprocessor, "gene_ids": bundle.gene_ids}, checkpoint_dir / f"preprocessor_fold_{fold:02d}.joblib")
 
         for name in model_names[:2]:
-            prediction, best_epoch, best_loss = train_neural_model(
+            prediction, best_epoch, best_loss, test_baseline = train_neural_model(
                 name, bundle, train_rows, validation_rows, test_rows, standardized, pcs,
                 n_components, args, device, fold, checkpoint_dir,
             )
             oof[name][test_rows] = prediction
+            baseline_oof[test_rows] = test_baseline
             logs.append({"fold": fold, "model": name, "n_train_samples": len(train_rows),
                          "n_validation_samples": len(validation_rows), "n_test_samples": len(test_rows),
                          "n_train_cell_lines": response.iloc[train_rows]["ModelID"].nunique(),
                          "n_validation_cell_lines": response.iloc[validation_rows]["ModelID"].nunique(),
                          "n_test_cell_lines": response.iloc[test_rows]["ModelID"].nunique(),
-                         "best_epoch": best_epoch, "best_validation_mse_standardized": best_loss})
+                         "best_epoch": best_epoch, "best_validation_combined_loss": best_loss})
         oof["drug_mean"][test_rows] = drug_mean_predictions(bundle, train_rows, test_rows)
+        if np.isnan(baseline_oof[test_rows]).any():
+            train_df = response.iloc[train_rows]
+            baseline_oof[test_rows] = drug_dataset_baselines(train_df, response.iloc[test_rows])
         print(f"Completed fold {fold}/{args.folds} on {device}; held out {response.iloc[test_rows]['ModelID'].nunique()} cell lines")
 
     if any(np.isnan(values).any() for values in oof.values()):
@@ -240,17 +309,28 @@ def main():
     output = output.rename(columns={"AUC_PUBLISHED": "true_AUC_PUBLISHED", "IC50_PUBLISHED": "true_IC50_PUBLISHED",
                                     "log2_IC50_PUBLISHED": "true_log2_IC50_PUBLISHED"})
     output["fold"] = fold_ids
+    output["train_fold_drug_dataset_mean_auc"] = baseline_oof[:, 0]
+    output["train_fold_drug_dataset_mean_log2_ic50"] = baseline_oof[:, 1]
+    output["true_AUC_within_drug"] = output["true_AUC_PUBLISHED"].to_numpy() - baseline_oof[:, 0]
+    output["true_log2_IC50_within_drug"] = output["true_log2_IC50_PUBLISHED"].to_numpy() - baseline_oof[:, 1]
     for name, values in oof.items():
         output[f"pred_{name}_auc"] = values[:, 0]
         output[f"pred_{name}_log2_ic50"] = values[:, 1]
         output[f"pred_{name}_ic50"] = np.exp2(values[:, 1])
+        output[f"pred_{name}_auc_within_drug"] = values[:, 0] - baseline_oof[:, 0]
+        output[f"pred_{name}_log2_ic50_within_drug"] = values[:, 1] - baseline_oof[:, 1]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output.to_csv(args.output_dir / "oof_predictions.csv", index=False)
     global_metrics, macro_metrics, per_drug_metrics = summarize_predictions(output, model_names)
+    within_summary, within_by_group = summarize_within_drug(
+        output, model_names, min_rank_samples=args.min_ranking_samples,
+    )
     global_metrics.to_csv(args.output_dir / "metrics_global.csv", index=False)
     macro_metrics.to_csv(args.output_dir / "metrics_per_drug_macro.csv", index=False)
     per_drug_metrics.to_csv(args.output_dir / "metrics_per_drug.csv", index=False)
+    within_summary.to_csv(args.output_dir / "metrics_within_drug_summary.csv", index=False)
+    within_by_group.to_csv(args.output_dir / "metrics_within_drug_by_group.csv", index=False)
     pd.DataFrame(logs).to_csv(args.output_dir / "training_folds.csv", index=False)
     config = vars(args)
     config.update({"device_resolved": str(device), "n_samples": int(len(response)),
@@ -258,6 +338,8 @@ def main():
                    "n_aligned_genes": int(len(bundle.gene_ids)), "gobert_embedding_dim": int(bundle.gene_embeddings.shape[1])})
     (args.output_dir / "run_config.json").write_text(json.dumps(config, indent=2, default=str), encoding="utf-8")
     print(global_metrics.to_string(index=False))
+    print("\nWithin-drug residual regression and ranking metrics:")
+    print(within_summary.to_string(index=False))
     print(f"Saved out-of-fold predictions and metrics to {args.output_dir.resolve()}")
 
 
