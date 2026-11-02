@@ -1,0 +1,11 @@
+fold,model,n_train_samples,n_validation_samples,n_test_samples,n_train_cell_lines,n_validation_cell_lines,n_test_cell_lines,best_epoch,best_validation_mse_standardized
+1,gobert_expression_fusion,12370,2652,3755,30,6,9,33,0.33025243878364563
+1,expression_drug_fusion,12370,2652,3755,30,6,9,7,0.39494505524635315
+2,gobert_expression_fusion,12507,2524,3746,30,6,9,24,0.501215398311615
+2,expression_drug_fusion,12507,2524,3746,30,6,9,7,0.5037088990211487
+3,gobert_expression_fusion,12409,2601,3767,30,6,9,18,0.3114219605922699
+3,expression_drug_fusion,12409,2601,3767,30,6,9,6,0.32561591267585754
+4,gobert_expression_fusion,12511,2518,3748,30,6,9,21,0.33932191133499146
+4,expression_drug_fusion,12511,2518,3748,30,6,9,6,0.4210453927516937
+5,gobert_expression_fusion,12313,2703,3761,30,6,9,30,0.36324968934059143
+5,expression_drug_fusion,12313,2703,3761,30,6,9,4,0.34587836265563965
