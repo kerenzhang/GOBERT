@@ -1,0 +1,17 @@
+# Local environments and downloaded dependencies.
+.work_deps/
+.colab-venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+drug_related_go/model_cache/
+
+# Training checkpoints belong in persistent storage, not future source commits.
+GoBERT/ckpt/
+GoBERT/runs/
+GoBERT/.test-output/
+
+# Nested upstream Git metadata; the source itself is included in this repository.
+**/.git/
