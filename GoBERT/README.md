@@ -3,6 +3,9 @@
 Follow [COLAB.md](COLAB.md) for installation, a smoke test, full training, and
 checkpoint resume commands.
 
+For UT Southwestern Nucleus, see [BIOHPC.md](BIOHPC.md) for storage, a terminal
+pull script, environment setup, and Slurm GPU submission.
+
 This folder contains the training model and masking code adapted from
 [MM-YY-WW/GoBERT](https://github.com/MM-YY-WW/GoBERT), upstream commit
 `5fe2e56`, with a single-GPU Colab entry point and sparse graph storage.
